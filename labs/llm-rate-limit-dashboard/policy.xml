@@ -1,0 +1,231 @@
+<!--
+=============================================================================
+AI Gateway - Token Rate Limiting Policy
+=============================================================================
+This policy implements:
+1. Managed Identity authentication to Azure OpenAI
+2. Token-based rate limiting (prevents API usage spikes)
+3. Token metrics emission to Application Insights
+4. CORS for browser-based testing
+
+When the token usage is exceeded, the caller receives a 429 Too Many Requests
+response status code.
+=============================================================================
+-->
+<policies>
+    <inbound>
+        <base />
+        
+        <!-- ================================================================
+             CORS Configuration
+             ================================================================
+             Enables cross-origin requests for browser-based testing
+             (Jupyter notebooks, web apps, etc.)
+             ================================================================ -->
+        <cors allow-credentials="false">
+            <allowed-origins>
+                <origin>*</origin>
+            </allowed-origins>
+            <allowed-methods>
+                <method>GET</method>
+                <method>POST</method>
+                <method>OPTIONS</method>
+            </allowed-methods>
+            <allowed-headers>
+                <header>*</header>
+            </allowed-headers>
+            <expose-headers>
+                <header>x-ratelimit-remaining-tokens</header>
+                <header>x-ratelimit-remaining-requests</header>
+            </expose-headers>
+        </cors>
+        
+        <!-- ================================================================
+             Managed Identity Authentication
+             ================================================================
+             Authenticates to Azure OpenAI using APIM's managed identity.
+             No API keys needed - uses Azure RBAC for secure access.
+             
+             The managed identity must have "Cognitive Services OpenAI User"
+             role on the Azure OpenAI resource.
+             ================================================================ -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com/" />
+        
+        <!-- ================================================================
+             Token Rate Limiting
+             ================================================================
+             Limits token consumption per subscription to prevent:
+             - Single consumers from exhausting shared quota
+             - Runaway costs from buggy or malicious clients
+             - Backend overload
+             
+             Configuration:
+             - tokens-per-minute: Maximum tokens allowed per minute (500 TPM)
+             - counter-key: Groups requests by subscription
+             - estimate-prompt-tokens: Pre-estimates prompt tokens
+             - remaining-tokens-header-name: Header showing remaining quota
+             
+             NOTE: 500 TPM is intentionally LOW for this lab to demonstrate
+             rate limiting. In production, use higher values (e.g., 10000+).
+             ================================================================ -->
+        <llm-token-limit
+            tokens-per-minute="500"
+            counter-key="@(context.Subscription.Id)"
+            estimate-prompt-tokens="true"
+            remaining-tokens-header-name="x-ratelimit-remaining-tokens" />
+        
+        <!-- ================================================================
+             Token Metrics Emission
+             ================================================================
+             Emits token usage metrics to Azure Monitor/Application Insights.
+             Useful for:
+             - Monitoring token consumption
+             - Creating usage dashboards
+             - Cost tracking and chargeback
+             ================================================================ -->
+        <llm-emit-token-metric namespace="AIGateway">
+            <dimension name="Subscription" value="@(context.Subscription.Id)" />
+            <dimension name="SubscriptionName" value="@(context.Subscription.Name)" />
+            <dimension name="API" value="@(context.Api.Name)" />
+            <dimension name="Operation" value="@(context.Operation.Id)" />
+        </llm-emit-token-metric>
+        
+        <!-- Store request timestamp for latency calculation -->
+        <set-variable name="requestTime" value="@(DateTime.UtcNow)" />
+        
+        <!-- Store request body for token counting -->
+        <set-variable name="requestBody" value="@(context.Request.Body.As<string>(preserveContent: true))" />
+        
+    </inbound>
+    
+    <backend>
+        <base />
+    </backend>
+    
+    <outbound>
+        <base />
+        
+        <!-- ================================================================
+             Stream Token Metrics to Event Hub (Real-time Dashboard)
+             ================================================================
+             Logs token usage to Event Hub for real-time monitoring.
+             The dashboard consumes these events to display live metrics.
+             
+             JSON payload includes:
+             - timestamp: When the request was processed
+             - subscription: Caller identification
+             - model: The AI model used
+             - prompt_tokens: Tokens in the request
+             - completion_tokens: Tokens in the response
+             - total_tokens: Combined token count
+             - latency_ms: Request processing time
+             - status_code: HTTP response status
+             ================================================================ -->
+        <choose>
+            <when condition="@(context.Response.StatusCode == 200)">
+                <!-- Parse response to extract token usage -->
+                <set-variable name="responseBody" value="@(context.Response.Body.As<string>(preserveContent: true))" />
+                <set-variable name="tokenUsage" value="@{
+                    try {
+                        var response = JObject.Parse((string)context.Variables["responseBody"]);
+                        var usage = response["usage"];
+                        return new JObject {
+                            ["prompt_tokens"] = usage?["prompt_tokens"] ?? 0,
+                            ["completion_tokens"] = usage?["completion_tokens"] ?? 0,
+                            ["total_tokens"] = usage?["total_tokens"] ?? 0
+                        }.ToString();
+                    } catch {
+                        return new JObject {
+                            ["prompt_tokens"] = 0,
+                            ["completion_tokens"] = 0,
+                            ["total_tokens"] = 0
+                        }.ToString();
+                    }
+                }" />
+                
+                <!-- Log to Event Hub for real-time dashboard -->
+                <log-to-eventhub logger-id="eventhub-logger">@{
+                    var start = (DateTime)context.Variables["requestTime"];
+                    var latencyMs = (int)(DateTime.UtcNow - start).TotalMilliseconds;
+                    var usage = JObject.Parse((string)context.Variables["tokenUsage"]);
+                    
+                    return new JObject {
+                        ["timestamp"] = DateTime.UtcNow.ToString("o"),
+                        ["subscription_id"] = context.Subscription.Id,
+                        ["subscription_name"] = context.Subscription.Name,
+                        ["api"] = context.Api.Name,
+                        ["operation"] = context.Operation.Id,
+                        ["model"] = context.Request.MatchedParameters["deployment-id"],
+                        ["prompt_tokens"] = usage["prompt_tokens"],
+                        ["completion_tokens"] = usage["completion_tokens"],
+                        ["total_tokens"] = usage["total_tokens"],
+                        ["latency_ms"] = latencyMs,
+                        ["status_code"] = context.Response.StatusCode,
+                        ["success"] = true
+                    }.ToString();
+                }</log-to-eventhub>
+            </when>
+        </choose>
+        
+        <!-- Add latency header for successful responses -->
+        <choose>
+            <when condition="@(context.Response.StatusCode == 200)">
+                <set-header name="x-request-duration-ms" exists-action="override">
+                    <value>@{
+                        var start = (DateTime)context.Variables["requestTime"];
+                        return ((int)(DateTime.UtcNow - start).TotalMilliseconds).ToString();
+                    }</value>
+                </set-header>
+            </when>
+        </choose>
+        
+        <!-- Identify response as coming through AI Gateway -->
+        <set-header name="x-powered-by" exists-action="override">
+            <value>AI-Gateway-APIM</value>
+        </set-header>
+        
+    </outbound>
+    
+    <on-error>
+        <base />
+        
+        <!-- Log rate limit events to Event Hub -->
+        <choose>
+            <when condition="@(context.Response.StatusCode == 429)">
+                <log-to-eventhub logger-id="eventhub-logger">@{
+                    var start = context.Variables.ContainsKey("requestTime") 
+                        ? (DateTime)context.Variables["requestTime"] 
+                        : DateTime.UtcNow;
+                    var latencyMs = (int)(DateTime.UtcNow - start).TotalMilliseconds;
+                    
+                    return new JObject {
+                        ["timestamp"] = DateTime.UtcNow.ToString("o"),
+                        ["subscription_id"] = context.Subscription.Id,
+                        ["subscription_name"] = context.Subscription.Name,
+                        ["api"] = context.Api.Name,
+                        ["operation"] = context.Operation?.Id ?? "unknown",
+                        ["model"] = context.Request.MatchedParameters.ContainsKey("deployment-id") 
+                            ? context.Request.MatchedParameters["deployment-id"] 
+                            : "unknown",
+                        ["prompt_tokens"] = 0,
+                        ["completion_tokens"] = 0,
+                        ["total_tokens"] = 0,
+                        ["latency_ms"] = latencyMs,
+                        ["status_code"] = 429,
+                        ["success"] = false,
+                        ["error"] = "Rate limit exceeded"
+                    }.ToString();
+                }</log-to-eventhub>
+            </when>
+        </choose>
+        
+        <!-- Add error information headers -->
+        <set-header name="x-error-reason" exists-action="override">
+            <value>@(context.LastError.Reason)</value>
+        </set-header>
+        <set-header name="x-error-message" exists-action="override">
+            <value>@(context.LastError.Message)</value>
+        </set-header>
+        
+    </on-error>
+</policies>

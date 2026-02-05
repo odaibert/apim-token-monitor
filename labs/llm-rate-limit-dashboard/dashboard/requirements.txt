@@ -1,0 +1,19 @@
+# AI Gateway Token Monitoring Dashboard
+# Requirements for the real-time Streamlit dashboard
+
+# Core dashboard framework
+streamlit>=1.30.0
+
+# Visualization
+plotly>=5.18.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Azure Event Hub (for real-time event streaming)
+azure-eventhub>=5.11.0
+
+# Optional: For checkpoint storage (recommended for production)
+# azure-eventhub-checkpointstoreblob>=1.1.0
+# azure-storage-blob>=12.19.0
